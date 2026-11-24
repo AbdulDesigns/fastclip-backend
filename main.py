@@ -244,16 +244,24 @@ def detect_streamer_face(frame_path: Path) -> tuple[dict | None, dict | None]:
 
 
 def get_best_video_encoder(resolution: str) -> tuple[list[str], str]:
-    """Detects available hardware encoder (VideoToolbox on macOS) or falls back to fast libx264."""
-    try:
-        p = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
-        if "h264_videotoolbox" in p.stdout:
-            bitrate = "28M" if resolution == "4k" else ("18M" if resolution == "2k" else "14M")
-            return (["-c:v", "h264_videotoolbox", "-b:v", bitrate, "-pix_fmt", "yuv420p"], "h264_videotoolbox")
-    except Exception:
-        pass
-    crf = "17" if resolution == "4k" else "18"
-    return (["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p"], "libx264")
+    """Selects visually lossless, razor-sharp H.264 High Profile encoding at 60fps."""
+    is_render = bool(os.getenv("RENDER"))
+    preset = "fast" if is_render else "medium"
+    # CRF 12 (locally) / 14 (cloud) gives visually lossless sharpness with 100% mobile & Reels compatibility
+    crf = "14" if is_render else ("10" if resolution == "4k" else "12")
+    return (
+        [
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-crf", crf,
+            "-profile:v", "high",
+            "-level", "5.2",
+            "-pix_fmt", "yuv420p",
+            "-r", "60",
+            "-fps_mode", "cfr",
+        ],
+        f"libx264-crf{crf}-60fps",
+    )
 
 
 def build_9_16_filter(
@@ -266,7 +274,7 @@ def build_9_16_filter(
     target_w: int,
     target_h: int
 ) -> tuple[str, str]:
-    """Builds the FFmpeg video filter for the selected 9:16 layout without aspect distortion."""
+    """Builds the FFmpeg video filter for the selected 9:16 layout at 60fps with Lanczos sharp scaling."""
     def to_even(v: int) -> int:
         return max(2, (int(v) // 2) * 2)
 
@@ -286,79 +294,77 @@ def build_9_16_filter(
     gh = to_even(min(get_coord(game, "h", 0.90) * source_h, source_h - gy))
 
     if layout == "split":
-        # Game on top, Cam on bottom
         if game_size == "50/50":
             ratio = 0.50
         elif game_size == "70/30":
             ratio = 0.70
-        else: # "60/40"
+        else:
             ratio = 0.60
         gh_out = to_even(target_h * ratio)
         ch_out = target_h - gh_out
 
         filter_str = (
-            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{gh_out}:force_original_aspect_ratio=increase,crop={target_w}:{gh_out}[top];"
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase,crop={target_w}:{ch_out}[bot];"
-            f"[top][bot]vstack=inputs=2[v_base]"
+            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{gh_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{gh_out}[top];"
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{ch_out}[bot];"
+            f"[top][bot]vstack=inputs=2[v_pre]"
         )
 
     elif layout == "big_cam":
-        # Cam on top 60%, Game on bottom 40%
         ch_out = to_even(target_h * 0.60)
         gh_out = target_h - ch_out
         filter_str = (
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase,crop={target_w}:{ch_out}[top];"
-            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{gh_out}:force_original_aspect_ratio=increase,crop={target_w}:{gh_out}[bot];"
-            f"[top][bot]vstack=inputs=2[v_base]"
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{ch_out}[top];"
+            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{gh_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{gh_out}[bot];"
+            f"[top][bot]vstack=inputs=2[v_pre]"
         )
 
     elif layout == "game_only":
-        filter_str = f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}[v_base]"
+        filter_str = f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{target_h}[v_pre]"
 
     elif layout == "whole_screen":
         filter_str = (
-            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},boxblur=20:20[bg];"
-            f"[0:v]scale={target_w}:-1[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v_base]"
+            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{target_h},boxblur=20:20[bg];"
+            f"[0:v]scale={target_w}:-2:flags=lanczos[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v_pre]"
         )
 
     elif layout == "cam_box":
         pip_w = to_even(target_w * 0.36)
         pip_h = to_even(pip_w * 0.75)
         filter_str = (
-            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}[bg];"
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={pip_w}:{pip_h}:force_original_aspect_ratio=increase,crop={pip_w}:{pip_h}[cam];"
-            f"[bg][cam]overlay=W-w-40:H-h-120[v_base]"
+            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{target_h}[bg];"
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={pip_w}:{pip_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={pip_w}:{pip_h}[cam];"
+            f"[bg][cam]overlay=W-w-40:H-h-120[v_pre]"
         )
 
     elif layout == "circle_cam":
         pip_s = to_even(target_w * 0.35)
         filter_str = (
-            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}[bg];"
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={pip_s}:{pip_s}:force_original_aspect_ratio=increase,crop={pip_s}:{pip_s}[cam];"
-            f"[bg][cam]overlay=W-w-40:H-h-120[v_base]"
+            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{target_h}[bg];"
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={pip_s}:{pip_s}:force_original_aspect_ratio=increase:flags=lanczos,crop={pip_s}:{pip_s}[cam];"
+            f"[bg][cam]overlay=W-w-40:H-h-120[v_pre]"
         )
 
     elif layout == "cam_game":
         ch_out = to_even(target_h * 0.40)
         filter_str = (
-            f"color=c=black:s={target_w}x{target_h}:d=9999[bg];"
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase,crop={target_w}:{ch_out}[cam];"
-            f"[0:v]scale={target_w}:-1[game];"
+            f"color=c=black:s={target_w}x{target_h}:r=60:d=9999[bg];"
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{ch_out}[cam];"
+            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:-2:flags=lanczos[game];"
             f"[bg][cam]overlay=0:0:shortest=1[tmp];"
-            f"[tmp][game]overlay=0:{ch_out + 40}:shortest=1[v_base]"
+            f"[tmp][game]overlay=0:{ch_out + 40}:shortest=1[v_pre]"
         )
 
     else:
-        # Default split 60/40
         gh_out = to_even(target_h * 0.60)
         ch_out = target_h - gh_out
         filter_str = (
-            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{gh_out}:force_original_aspect_ratio=increase,crop={target_w}:{gh_out}[top];"
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase,crop={target_w}:{ch_out}[bot];"
-            f"[top][bot]vstack=inputs=2[v_base]"
+            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={target_w}:{gh_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{gh_out}[top];"
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{ch_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{ch_out}[bot];"
+            f"[top][bot]vstack=inputs=2[v_pre]"
         )
 
+    filter_str = f"{filter_str};[v_pre]fps=60[v_base]"
     return filter_str, "[v_base]"
 
 
@@ -518,10 +524,11 @@ def worker(job_id: str, req: ClipRequest):
                 print(f"Cache slice extraction notice: {ce}")
 
         if not extracted_from_cache:
-            # Build yt-dlp arguments preferring reliable H.264 stream to prevent throttling/hangs
+            # Download highest possible quality & 60fps from source (4K/1440p/1080p60) for razor-sharp crops
             ytdlp_cmd = build_ytdlp_base_cmd()
             ytdlp_cmd.extend([
-                "-f", "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                "-S", "res,fps",
+                "-f", "bestvideo[fps>=50]+bestaudio/bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
                 "-o", str(work / "source.%(ext)s")
             ])
@@ -534,18 +541,19 @@ def worker(job_id: str, req: ClipRequest):
 
             ytdlp_cmd.append(clean_url)
             try:
-                run(ytdlp_cmd, timeout=120)
+                run(ytdlp_cmd, timeout=240)
             except Exception as dl_err:
-                # Fast fallback with 720p or standard progressive
+                # Fallback if 60fps/merge fails
                 try:
                     fallback_cmd = build_ytdlp_base_cmd() + [
-                        "-f", "best[height<=720]/b/best",
+                        "-f", "bestvideo+bestaudio/best",
+                        "--merge-output-format", "mp4",
                         "-o", str(work / "source.%(ext)s"),
                     ]
                     if req.start_seconds is not None and req.end_seconds is not None:
                         fallback_cmd.extend(["--download-sections", f"*{req.start_seconds}-{req.end_seconds}"])
                     fallback_cmd.append(clean_url)
-                    run(fallback_cmd, timeout=90)
+                    run(fallback_cmd, timeout=180)
                 except Exception:
                     raise dl_err
 
@@ -699,18 +707,19 @@ def worker(job_id: str, req: ClipRequest):
                         input_idx += 1
 
                 final_filter = ";".join(filter_parts)
-                # Map the final video output
+                # Map the final video output at 60fps & high-bitrate audio
                 cmd.extend([
                     "-filter_complex", final_filter,
                     "-map", cur_v,
                     "-map", "0:a:0?",
                     *enc_args,
                     "-c:a", "aac",
-                    "-b:a", "192k",
+                    "-b:a", "320k",
+                    "-ar", "48000",
                     "-movflags", "+faststart",
                     str(out)
                 ])
-                run(cmd)
+                run(cmd, timeout=600)
 
             outputs.append({
                 "name": out.name,
@@ -724,7 +733,7 @@ def worker(job_id: str, req: ClipRequest):
         t_total = (datetime.now() - t_start).total_seconds()
         render_summary = (
             f"Done in {t_total:.1f}s (dl: {t_dl:.1f}s, render: {t_total - t_dl:.1f}s) "
-            f"via {enc_name} at {req.resolution} 9:16 {req.layout}"
+            f"via {enc_name} at {req.resolution} 60fps 9:16 {req.layout}"
         )
 
         update(
