@@ -56,6 +56,7 @@ def build_ytdlp_base_cmd() -> list[str]:
         "--no-check-certificates",
         "--no-playlist",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android,ios,web",
         "--js-runtimes", f"deno:{DENO_PATH}",
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 10000000",
         "--concurrent-fragments", "4"
