@@ -31,7 +31,23 @@ FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 COOKIES_FILE = Path(__file__).resolve().parent / "youtube_cookies.txt"
 DENO_PATH = shutil.which("deno") or ("/opt/homebrew/bin/deno" if Path("/opt/homebrew/bin/deno").exists() else "deno")
 
+def ensure_cookies():
+    """Restores YouTube cookies from YOUTUBE_COOKIES_BASE64 environment variable if available."""
+    b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
+    if b64:
+        try:
+            import base64
+            decoded = base64.b64decode(b64.strip())
+            if not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < len(decoded):
+                COOKIES_FILE.write_bytes(decoded)
+                logger.info(f"Loaded {len(decoded)} bytes of YouTube cookies from environment.")
+        except Exception as e:
+            logger.warning(f"Failed to decode YOUTUBE_COOKIES_BASE64: {e}")
+
+ensure_cookies()
+
 def build_ytdlp_base_cmd() -> list[str]:
+    ensure_cookies()
     cmd = [
         "yt-dlp",
         "--no-check-certificates",
@@ -41,7 +57,7 @@ def build_ytdlp_base_cmd() -> list[str]:
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 10000000",
         "--concurrent-fragments", "4"
     ]
-    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 500:
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 100:
         cmd.extend(["--cookies", str(COOKIES_FILE)])
     else:
         # Fallback to local browser cookies if brave exists
@@ -886,14 +902,11 @@ def get_stream_info(req: StreamInfoRequest):
 
     # 1. Inspect stream metadata via yt-dlp with oEmbed fallback
     try:
-        raw_json = run([
-            "yt-dlp",
-            "--no-check-certificates",
+        ytdlp_cmd = build_ytdlp_base_cmd() + [
             "--dump-json",
-            "--no-playlist",
-            "--js-runtimes", "node:/usr/local/bin/node",
             clean_url
-        ])
+        ]
+        raw_json = run(ytdlp_cmd)
         meta = json.loads(raw_json)
         title = meta.get("title", "Livestream")
         duration = float(meta.get("duration") or 0.0)
@@ -901,6 +914,7 @@ def get_stream_info(req: StreamInfoRequest):
         src_w = int(meta.get("width") or 1920)
         src_h = int(meta.get("height") or 1080)
     except Exception as e:
+        logger.warning(f"yt-dlp metadata fetch failed, falling back to oEmbed: {e}")
         # Fallback to oEmbed for title
         oembed = fetch_youtube_oembed(clean_url)
         title = oembed.get("title") or "Livestream"
@@ -969,7 +983,7 @@ def get_stream_info(req: StreamInfoRequest):
     }
 
 
-@app.get("/frames/{filename}")
+@app.api_route("/frames/{filename}", methods=["GET", "HEAD"])
 def get_frame(filename: str):
     path = (FRAMES_DIR / filename).resolve()
     if path.parent != FRAMES_DIR.resolve() or not path.is_file():
