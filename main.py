@@ -77,7 +77,7 @@ class BoxRect(BaseModel):
 
 
 class ClipRequest(BaseModel):
-    url: HttpUrl
+    url: str
     start_seconds: float | None = None
     end_seconds: float | None = None
     language: str = "en"
@@ -97,11 +97,11 @@ class ClipRequest(BaseModel):
 
 
 class StreamFrameRequest(BaseModel):
-    url: HttpUrl
+    url: str
     timestamp_seconds: float = 60.0
 
 class StreamInfoRequest(BaseModel):
-    url: HttpUrl
+    url: str
     timestamp_seconds: float = 60.0
 
 
@@ -118,10 +118,16 @@ def run(args: list[str], timeout: float = 180.0) -> str:
 
 
 def normalize_url(raw_url: str) -> str:
-    live_match = re.search(r"youtube\.com/live/([A-Za-z0-9_-]{11})", raw_url)
-    if live_match:
-        return f"https://www.youtube.com/watch?v={live_match.group(1)}"
-    return raw_url
+    url = raw_url.strip()
+    if not url:
+        return ""
+    # Extract 11-character YouTube video ID if present
+    yt_match = re.search(r"(?:v=|/live/|youtu\.be/|/shorts/|/embed/|^)([A-Za-z0-9_-]{11})(?:$|[?&/])", url)
+    if yt_match:
+        return f"https://www.youtube.com/watch?v={yt_match.group(1)}"
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return f"https://{url}"
+    return url
 
 
 def extract_video_id(raw_url: str) -> str:
