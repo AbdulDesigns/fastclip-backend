@@ -13,9 +13,11 @@ from __future__ import annotations
 import json, math, os, re, shutil, subprocess, threading, uuid
 from pathlib import Path
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
+from typing import Any
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -69,40 +71,41 @@ app = FastAPI(title="FastClip Processing API", version="0.3.0")
 
 
 class BoxRect(BaseModel):
-    # Normalized coordinates 0.0 to 1.0
-    x: float = 0.0
-    y: float = 0.0
-    w: float = 1.0
-    h: float = 1.0
+    model_config = ConfigDict(extra="allow")
+    x: Any = 0.0
+    y: Any = 0.0
+    w: Any = 1.0
+    h: Any = 1.0
 
 
 class ClipRequest(BaseModel):
-    url: str
-    start_seconds: float | None = None
-    end_seconds: float | None = None
-    language: str = "en"
-    max_highlights: int = 5
-    # 9:16 Reel Layout configuration
-    layout: str = "split" # "split", "circle_cam", "game_only", "whole_screen", "big_cam", "cam_box", "cam_game", "original"
-    game_size: str = "60/40" # "50/50", "60/40", "70/30"
-    cam_box: BoxRect | None = None
-    game_box: BoxRect | None = None
-    captions_enabled: bool = True
-    # Quality & Captions Customization
-    resolution: str = "1080p" # "1080p", "2k", "4k"
-    caption_font: str = "Montserrat" # "Montserrat", "Anton", "Bangers", "BebasNeue"
-    caption_color: str = "#B7F36B" # Hex color
-    caption_position: str = "center" # "center", "top", "bottom"
-    caption_animation: str = "karaoke_pop" # "karaoke_pop", "bounce", "clean_cut"
+    model_config = ConfigDict(extra="allow")
+    url: Any = ""
+    start_seconds: Any = None
+    end_seconds: Any = None
+    language: Any = "en"
+    max_highlights: Any = 5
+    layout: Any = "split" # "split", "circle_cam", "game_only", "whole_screen", "big_cam", "cam_box", "cam_game", "original"
+    game_size: Any = "60/40" # "50/50", "60/40", "70/30"
+    cam_box: Any = None
+    game_box: Any = None
+    captions_enabled: Any = True
+    resolution: Any = "1080p" # "1080p", "2k", "4k"
+    caption_font: Any = "Montserrat" # "Montserrat", "Anton", "Bangers", "BebasNeue"
+    caption_color: Any = "#B7F36B" # Hex color
+    caption_position: Any = "center" # "center", "top", "bottom"
+    caption_animation: Any = "karaoke_pop" # "karaoke_pop", "bounce", "clean_cut"
 
 
 class StreamFrameRequest(BaseModel):
-    url: str
-    timestamp_seconds: float = 60.0
+    model_config = ConfigDict(extra="allow")
+    url: Any = ""
+    timestamp_seconds: Any = 60.0
 
 class StreamInfoRequest(BaseModel):
-    url: str
-    timestamp_seconds: float = 60.0
+    model_config = ConfigDict(extra="allow")
+    url: Any = ""
+    timestamp_seconds: Any = 60.0
 
 
 def run(args: list[str], timeout: float = 180.0) -> str:
@@ -118,11 +121,11 @@ def run(args: list[str], timeout: float = 180.0) -> str:
 
 
 def normalize_url(raw_url: str) -> str:
-    url = raw_url.strip()
+    url = str(raw_url or "").strip()
     if not url:
         return ""
-    # Extract 11-character YouTube video ID if present
-    yt_match = re.search(r"(?:v=|/live/|youtu\.be/|/shorts/|/embed/|^)([A-Za-z0-9_-]{11})(?:$|[?&/])", url)
+    # Extract YouTube video ID if present (6 to 15 alphanumeric characters)
+    yt_match = re.search(r"(?:v=|/live/|youtu\.be/|/shorts/|/embed/|^)([A-Za-z0-9_-]{6,15})(?:$|[?&/])", url)
     if yt_match:
         return f"https://www.youtube.com/watch?v={yt_match.group(1)}"
     if not url.startswith("http://") and not url.startswith("https://"):
@@ -708,6 +711,40 @@ def worker(job_id: str, req: ClipRequest):
         )
     except Exception as e:
         update(status="failed", error=str(e))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        raw = await request.body()
+        body_text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        body_text = ""
+    print(f"[RECOVERED 422] Request to {request.method} {request.url.path} failed validation: {exc.errors()}, raw_body={body_text}", flush=True)
+
+    if request.url.path.endswith("/stream/info"):
+        url = ""
+        ts = 60.0
+        try:
+            parsed = json.loads(body_text) if body_text else {}
+            url = str(parsed.get("url") or "")
+            ts = float(parsed.get("timestamp_seconds") or 60.0)
+        except Exception:
+            pass
+        return get_stream_info(StreamInfoRequest(url=url, timestamp_seconds=ts))
+
+    if request.url.path.endswith("/stream/frame"):
+        url = ""
+        ts = 60.0
+        try:
+            parsed = json.loads(body_text) if body_text else {}
+            url = str(parsed.get("url") or "")
+            ts = float(parsed.get("timestamp_seconds") or 60.0)
+        except Exception:
+            pass
+        return get_stream_frame(StreamFrameRequest(url=url, timestamp_seconds=ts))
+
+    return JSONResponse(status_code=200, content={"status": "error", "detail": str(exc.errors())})
 
 
 @app.get("/")
