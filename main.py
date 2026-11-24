@@ -10,7 +10,7 @@ Features:
 - Indic transliteration for Hindi-to-Hinglish stream captions
 """
 from __future__ import annotations
-import json, math, os, re, shutil, subprocess, threading, uuid
+import json, logging, math, os, re, shutil, subprocess, threading, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +21,9 @@ from pydantic import BaseModel, ConfigDict
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("fastclip")
 
 default_data = Path(os.path.expanduser("~/.fastclip/data"))
 ROOT = Path(os.getenv("FASTCLIP_DATA", str(default_data)))
