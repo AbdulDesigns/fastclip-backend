@@ -55,16 +55,16 @@ def build_ytdlp_base_cmd() -> list[str]:
         "yt-dlp",
         "--no-check-certificates",
         "--no-playlist",
+        "--no-part",
+        "--retries", "3",
+        "--fragment-retries", "3",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=android,ios,web",
         "--js-runtimes", f"deno:{DENO_PATH}",
-        "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 10000000",
         "--concurrent-fragments", "4"
     ]
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 100:
         cmd.extend(["--cookies", str(COOKIES_FILE)])
     else:
-        # Fallback to local browser cookies if brave exists
         try:
             if Path("/Applications/Brave Browser.app").exists():
                 cmd.extend(["--cookies-from-browser", "brave"])
@@ -214,11 +214,11 @@ def detect_streamer_face(frame_path: Path) -> tuple[dict | None, dict | None]:
             cx = (fx + fw / 2.0) / float(w)
             cy = (fy + fh / 2.0) / float(h)
 
-            # Streamer cam box (width=0.28, height=0.36, centered on face with slight downward chest offset)
-            box_w = 0.28
-            box_h = 0.36
+            # Streamer cam box (tight around facecam, centered on face with slight chest offset)
+            box_w = 0.21
+            box_h = 0.25
             box_x = max(0.0, min(1.0 - box_w, cx - box_w / 2.0))
-            box_y = max(0.0, min(1.0 - box_h, cy - box_h / 2.0 + 0.04))
+            box_y = max(0.0, min(1.0 - box_h, cy - box_h / 2.0 + 0.03))
 
             # Gameplay box: place opposite the facecam
             if cx < 0.5:
@@ -244,15 +244,36 @@ def detect_streamer_face(frame_path: Path) -> tuple[dict | None, dict | None]:
 
 
 def get_best_video_encoder(resolution: str) -> tuple[list[str], str]:
-    """Selects visually lossless, razor-sharp H.264 High Profile encoding at 60fps."""
-    is_render = bool(os.getenv("RENDER"))
-    preset = "fast" if is_render else "medium"
-    # CRF 12 (locally) / 14 (cloud) gives visually lossless sharpness with 100% mobile & Reels compatibility
-    crf = "14" if is_render else ("10" if resolution == "4k" else "12")
+    """Selects Apple VideoToolbox GPU encoder locally (10x faster, sharp high-bitrate) or libx264 on Linux."""
+    try:
+        p = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True, timeout=5)
+        if "h264_videotoolbox" in p.stdout:
+            if resolution == "4k":
+                br, maxr, bufr = "45M", "65M", "90M"
+            elif resolution == "2k":
+                br, maxr, bufr = "30M", "45M", "60M"
+            else:
+                br, maxr, bufr = "22M", "32M", "44M"
+            return (
+                [
+                    "-c:v", "h264_videotoolbox",
+                    "-b:v", br,
+                    "-maxrate", maxr,
+                    "-bufsize", bufr,
+                    "-profile:v", "high",
+                    "-pix_fmt", "yuv420p",
+                    "-r", "60",
+                    "-fps_mode", "cfr",
+                ],
+                f"h264_videotoolbox-{br}-60fps",
+            )
+    except Exception:
+        pass
+    crf = "15" if resolution == "4k" else "16"
     return (
         [
             "-c:v", "libx264",
-            "-preset", preset,
+            "-preset", "veryfast",
             "-crf", crf,
             "-profile:v", "high",
             "-level", "5.2",
@@ -368,7 +389,72 @@ def build_9_16_filter(
     return filter_str, "[v_base]"
 
 
-def generate_caption_overlays(
+def _ease_out_back(u: float) -> float:
+    u = max(0.0, min(1.0, u))
+    c1 = 1.70158
+    c3 = c1 + 1.0
+    p = u - 1.0
+    return 1.0 + c3 * (p * p * p) + c1 * (p * p)
+
+
+def _ease_out_cubic(u: float) -> float:
+    u = max(0.0, min(1.0, u))
+    p = 1.0 - u
+    return 1.0 - p * p * p
+
+
+def _build_word_chunks(transcript: list[dict], clip_start: float, clip_end: float) -> list[dict]:
+    """Converts transcript segments + word timestamps into punchy 2-3 word caption cues."""
+    all_words = []
+    for seg in transcript:
+        s_a = max(clip_start, float(seg.get("start", 0.0)))
+        s_b = min(clip_end, float(seg.get("end", 0.0)))
+        if s_b - s_a < 0.12:
+            continue
+        seg_words = seg.get("words") or []
+        if seg_words:
+            for w in seg_words:
+                wa = max(clip_start, float(w.get("start", s_a))) - clip_start
+                wb = min(clip_end, float(w.get("end", s_b))) - clip_start
+                wt = to_hinglish(str(w.get("word", "")).strip())
+                if wt and wb > wa:
+                    all_words.append({"word": wt.upper(), "start": wa, "end": wb})
+        else:
+            raw = to_hinglish(str(seg.get("text", "")).strip())
+            parts = raw.split()
+            if not parts:
+                continue
+            dt = (s_b - s_a) / len(parts)
+            for idx_w, pw in enumerate(parts):
+                wa = (s_a + idx_w * dt) - clip_start
+                wb = (s_a + (idx_w + 1) * dt) - clip_start
+                all_words.append({"word": pw.upper(), "start": wa, "end": wb})
+
+    cues = []
+    cur: list[dict] = []
+    cur_chars = 0
+    for w in all_words:
+        wlen = len(w["word"])
+        if cur and (len(cur) >= 3 or cur_chars + wlen + 1 > 17 or (w["start"] - cur[-1]["end"]) > 0.65):
+            cues.append({
+                "start": cur[0]["start"],
+                "end": max(cur[-1]["end"], cur[0]["start"] + 0.25),
+                "words": cur,
+            })
+            cur = []
+            cur_chars = 0
+        cur.append(w)
+        cur_chars += wlen + 1
+    if cur:
+        cues.append({
+            "start": cur[0]["start"],
+            "end": max(cur[-1]["end"], cur[0]["start"] + 0.25),
+            "words": cur,
+        })
+    return cues
+
+
+def generate_animated_captions_mov(
     transcript: list[dict],
     clip_start: float,
     clip_end: float,
@@ -378,111 +464,226 @@ def generate_caption_overlays(
     color_hex: str,
     position: str,
     animation: str,
-    output_dir: Path
-) -> list[tuple[Path, float, float]]:
-    """Generates transparent PNG overlays with styled, transliterated, animated captions."""
+    out_mov: Path
+) -> tuple[bool, int, int, int]:
+    """
+    Renders a smooth 60fps transparent QuickTime RLE (.mov) caption strip using
+    word-level timestamps, elastic spring/cubic easing, and single-overlay compositing.
+    Returns (created, strip_render_w, strip_render_h, band_y_in_target).
+    """
+    cues = _build_word_chunks(transcript, clip_start, clip_end)
+    if not cues:
+        return False, 0, 0, 0
+
+    dur = max(0.5, clip_end - clip_start)
+    render_w = min(target_w, 1080)
+    render_h = 260
+    scale_to_target = target_h / 1920.0
+    band_h_target = int(render_h * (target_w / float(render_w)))
+
+    if position == "top":
+        band_y = int(target_h * 0.11)
+    elif position == "bottom":
+        band_y = max(0, min(target_h - band_h_target, int(target_h * 0.82) - band_h_target // 2))
+    else:
+        band_y = max(0, int(target_h * 0.56) - band_h_target // 2)
+
     font_file = FONT_MAP.get(font_family.lower().replace(" ", ""), FONT_MAP["montserrat"])
     if not font_file.exists():
         font_file = FONT_MAP["montserrat"]
 
-    scale_factor = target_h / 1920.0
-    font_size = int(60 * scale_factor)
-    stroke_w = int(7 * scale_factor)
+    base_size = 56
+    pop_size = 64
+    small_size = 44
+    def _load_heavy_font(sz: int):
+        f = ImageFont.truetype(str(font_file), sz)
+        try:
+            f.set_variation_by_axes([850])
+        except Exception:
+            pass
+        return f
 
     try:
-        pil_font = ImageFont.truetype(str(font_file), font_size)
+        font_base = _load_heavy_font(base_size)
+        font_pop = _load_heavy_font(pop_size)
+        font_small = _load_heavy_font(small_size)
     except Exception:
-        pil_font = ImageFont.load_default()
+        font_base = font_pop = font_small = ImageFont.load_default()
 
-    primary_color = parse_hex_color(color_hex, default=(183, 243, 107))
-    white_color = (255, 255, 255)
-    outline_color = (0, 0, 0, 255)
+    accent_rgb = parse_hex_color(color_hex, default=(243, 107, 22))
+    accent_lum = (0.299 * accent_rgb[0] + 0.587 * accent_rgb[1] + 0.114 * accent_rgb[2]) / 255.0
+    pill_text_rgb = (18, 18, 17) if accent_lum > 0.55 else (250, 249, 247)
+    ink_light = (250, 249, 247)
+    fps = 60
+    total_frames = max(1, int(math.ceil(dur * fps)))
+    empty_bytes = Image.new("RGBA", (render_w, render_h), (0, 0, 0, 0)).tobytes()
 
-    # Position Y coordinate
-    if position == "top":
-        base_y = int(target_h * 0.16)
-    elif position == "bottom":
-        base_y = int(target_h * 0.82)
-    else: # "center" - right at the split boundary / focal area
-        base_y = int(target_h * 0.58)
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgba",
+            "-s", f"{render_w}x{render_h}", "-r", str(fps), "-i", "-",
+            "-c:v", "qtrle", str(out_mov)
+        ],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
 
-    overlays = []
-    idx = 0
+    cue_ptr = 0
+    cached_key = None
+    cached_bytes = empty_bytes
 
-    for seg in transcript:
-        s_start = max(clip_start, seg["start"])
-        s_end = min(clip_end, seg["end"])
-        if s_end - s_start < 0.25:
-            continue
+    def pick_scaled_font(scale_val: float) -> ImageFont.FreeTypeFont:
+        if scale_val >= 1.07:
+            return font_pop
+        if scale_val <= 0.88:
+            return font_small
+        return font_base
 
-        raw_text = seg.get("text", "").strip()
-        if not raw_text:
-            continue
+    try:
+        for f_idx in range(total_frames):
+            t = f_idx / float(fps)
+            while cue_ptr < len(cues) and t > cues[cue_ptr]["end"]:
+                cue_ptr += 1
 
-        # Transliterate Hindi to Hinglish if necessary
-        text = to_hinglish(raw_text)
-
-        # Break long sentences into punchy 3-5 word chunks
-        words = text.split()
-        if not words:
-            continue
-
-        chunk_size = 4
-        dur_per_word = (s_end - s_start) / max(1, len(words))
-
-        for w_idx in range(0, len(words), chunk_size):
-            chunk_words = words[w_idx:w_idx + chunk_size]
-            c_start = s_start + w_idx * dur_per_word - clip_start
-            c_end = s_start + min(len(words), w_idx + chunk_size) * dur_per_word - clip_start
-
-            if c_end <= c_start:
+            if cue_ptr >= len(cues) or t < cues[cue_ptr]["start"]:
+                proc.stdin.write(empty_bytes)
                 continue
 
-            chunk_text = " ".join(chunk_words).upper()
-            png_path = output_dir / f"caption_{idx:03d}.png"
+            cue = cues[cue_ptr]
+            c_a, c_b = cue["start"], cue["end"]
+            words = cue["words"]
 
-            img = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            # Active spoken word index
+            active_idx = len(words) - 1
+            for wi, w in enumerate(words):
+                if t <= w["end"]:
+                    active_idx = wi
+                    break
+
+            phrase_age = t - c_a
+            phrase_left = c_b - t
+            w_age = t - words[active_idx]["start"]
+
+            # Smooth opacity envelope
+            alpha = 1.0
+            if phrase_age < 0.08:
+                alpha = _ease_out_cubic(phrase_age / 0.08)
+            elif phrase_left < 0.07:
+                alpha = max(0.0, phrase_left / 0.07)
+
+            # Determine if this frame is an invariant steady-state hold
+            steady_phrase = phrase_age >= 0.18 and phrase_left >= 0.08
+            steady_word = w_age >= 0.15
+            state_key = (cue_ptr, active_idx, steady_phrase, steady_word)
+            if steady_phrase and steady_word and state_key == cached_key:
+                proc.stdin.write(cached_bytes)
+                continue
+
+            img = Image.new("RGBA", (render_w, render_h), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
 
-            # Apply animation visual tweaks
-            y_pos = base_y
+            # Motion curve by style
             if animation == "bounce":
-                # Subtle bounce pop
-                y_pos -= int(10 * scale_factor)
+                enter_u = min(1.0, phrase_age / 0.16)
+                scale_p = 0.78 + 0.22 * _ease_out_back(enter_u)
+                y_shift = -int(22 * (1.0 - _ease_out_back(enter_u)))
+            elif animation == "clean_cut":
+                enter_u = min(1.0, phrase_age / 0.14)
+                scale_p = 1.0
+                y_shift = int(18 * (1.0 - _ease_out_cubic(enter_u)))
+            else:
+                # karaoke_pop
+                enter_u = min(1.0, phrase_age / 0.10)
+                scale_p = 0.92 + 0.08 * _ease_out_back(enter_u)
+                y_shift = int(8 * (1.0 - _ease_out_cubic(enter_u)))
 
-            # Draw drop shadow
-            draw.text(
-                (target_w // 2 + int(4 * scale_factor), y_pos + int(4 * scale_factor)),
-                chunk_text,
-                font=pil_font,
-                anchor="mm",
-                stroke_width=stroke_w,
-                stroke_fill=(0, 0, 0, 200),
-                fill=(0, 0, 0, 200)
-            )
+            cy = render_h // 2 + y_shift
+            gap = 18
 
-            # Draw text with thick outline
-            # If karaoke_pop, use vibrant accent color; else use primary color
-            fill_col = (*primary_color, 255) if (animation == "karaoke_pop" or idx % 2 == 0) else (*white_color, 255)
-            draw.text(
-                (target_w // 2, y_pos),
-                chunk_text,
-                font=pil_font,
-                anchor="mm",
-                stroke_width=stroke_w,
-                stroke_fill=outline_color,
-                fill=fill_col
-            )
+            # Measure each word width cleanly
+            word_specs = []
+            total_w = 0
+            for wi, w in enumerate(words):
+                is_act = (wi == active_idx)
+                w_scale = scale_p
+                if is_act and animation in ("karaoke_pop", "bounce"):
+                    pop_u = min(1.0, max(0.0, w_age) / 0.14)
+                    # Overshoot peak to ~1.16 then settle cleanly to 1.10
+                    w_scale = scale_p * (1.0 + 0.12 * _ease_out_back(pop_u))
+                wf = pick_scaled_font(w_scale)
+                bbox = draw.textbbox((0, 0), w["word"], font=wf, stroke_width=5)
+                ww = max(10, bbox[2] - bbox[0])
+                wh = max(20, bbox[3] - bbox[1])
+                word_specs.append((w["word"], wf, ww, wh, is_act))
+                total_w += ww
+            total_w += gap * max(0, len(word_specs) - 1)
 
-            img.save(str(png_path), format="PNG")
-            overlays.append((png_path, c_start, c_end))
-            idx += 1
-            if idx >= 40: # FFmpeg input ceiling
-                break
-        if idx >= 40:
-            break
+            a_byte = int(max(0, min(255, round(alpha * 255))))
 
-    return overlays
+            # Clean dark pill backing for clean_cut / karaoke_pop readability
+            if animation == "clean_cut":
+                pad_x, pad_y = 30, 22
+                pill_a = int(205 * alpha)
+                border_a = int(45 * alpha)
+                x0 = render_w // 2 - total_w // 2 - pad_x
+                x1 = render_w // 2 + total_w // 2 + pad_x
+                y0 = cy - 44 - pad_y // 2
+                y1 = cy + 44 + pad_y // 2
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=22, fill=(18, 18, 17, pill_a), outline=(250, 249, 247, border_a), width=2)
+
+            cursor_x = render_w // 2 - total_w // 2
+            for w_text, wf, ww, wh, is_act in word_specs:
+                wx = cursor_x + ww // 2
+                if is_act and animation == "karaoke_pop":
+                    # Vibrant highlighted pill behind the active word with high-contrast text
+                    pill_x0 = cursor_x - 12
+                    pill_x1 = cursor_x + ww + 12
+                    pill_y0 = cy - wh // 2 - 12
+                    pill_y1 = cy + wh // 2 + 12
+                    draw.rounded_rectangle([pill_x0, pill_y0, pill_x1, pill_y1], radius=14, fill=(*accent_rgb, a_byte))
+                    draw.text((wx, cy), w_text, font=wf, anchor="mm", fill=(*pill_text_rgb, a_byte))
+                else:
+                    # Two-pass rendering: outer shadow/outline first, crisp inner fill on top
+                    draw.text(
+                        (wx + 3, cy + 4),
+                        w_text,
+                        font=wf,
+                        anchor="mm",
+                        stroke_width=5,
+                        stroke_fill=(0, 0, 0, int(195 * alpha)),
+                        fill=(0, 0, 0, int(195 * alpha)),
+                    )
+                    draw.text(
+                        (wx, cy),
+                        w_text,
+                        font=wf,
+                        anchor="mm",
+                        stroke_width=4,
+                        stroke_fill=(12, 12, 12, a_byte),
+                        fill=(12, 12, 12, a_byte),
+                    )
+                    txt_fill = (*accent_rgb, a_byte) if is_act else (*ink_light, a_byte)
+                    draw.text((wx, cy), w_text, font=wf, anchor="mm", fill=txt_fill)
+                cursor_x += ww + gap
+
+            frame_bytes = img.tobytes()
+            cached_key = state_key
+            cached_bytes = frame_bytes
+            proc.stdin.write(frame_bytes)
+
+        proc.stdin.close()
+        rc = proc.wait()
+        if rc != 0 or not out_mov.exists():
+            err_txt = proc.stderr.read().decode(errors="ignore")
+            logger.warning(f"Caption mov encode error rc={rc}: {err_txt[-500:]}")
+            return False, 0, 0, 0
+        return True, render_w, render_h, band_y
+    except Exception as ce:
+        logger.warning(f"Caption strip generator failed: {ce}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, 0, 0, 0
 
 
 def extract_audio_pcm(file_path: Path) -> np.ndarray:
@@ -527,7 +728,7 @@ def worker(job_id: str, req: ClipRequest):
             # Download highest possible quality & 60fps from source (4K/1440p/1080p60) for razor-sharp crops
             ytdlp_cmd = build_ytdlp_base_cmd()
             ytdlp_cmd.extend([
-                "-S", "res,fps",
+                "-S", "res,fps,vcodec:h264",
                 "-f", "bestvideo[fps>=50]+bestaudio/bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
                 "-o", str(work / "source.%(ext)s")
@@ -587,7 +788,18 @@ def worker(job_id: str, req: ClipRequest):
                 segments, info = model.transcribe(audio_pcm, language=req.language if req.language != "auto" else None, vad_filter=True, word_timestamps=True)
                 for s in segments:
                     clean_text = to_hinglish(s.text.strip())
-                    transcript.append({"start": float(s.start), "end": float(s.end), "text": clean_text})
+                    word_list = []
+                    if getattr(s, "words", None):
+                        for w in s.words:
+                            wt = to_hinglish(w.word.strip())
+                            if wt:
+                                word_list.append({"word": wt, "start": float(w.start), "end": float(w.end)})
+                    transcript.append({
+                        "start": float(s.start),
+                        "end": float(s.end),
+                        "text": clean_text,
+                        "words": word_list,
+                    })
             except Exception as we:
                 print(f"Whisper transcription fallback: {we}")
                 transcript = []
@@ -681,11 +893,10 @@ def worker(job_id: str, req: ClipRequest):
 
                 filter_parts = [base_filter]
 
-                # Burn captions directly if enabled
+                # Burn smooth 60fps word-by-word animated captions via a single strip overlay
                 if req.captions_enabled and caption_rows:
-                    caps_dir = work / f"caps_{idx:02d}"
-                    caps_dir.mkdir(parents=True, exist_ok=True)
-                    overlays = generate_caption_overlays(
+                    caps_mov = work / f"caps_{idx:02d}.mov"
+                    ok_caps, strip_w, _, band_y = generate_animated_captions_mov(
                         transcript=transcript,
                         clip_start=start,
                         clip_end=end,
@@ -695,16 +906,16 @@ def worker(job_id: str, req: ClipRequest):
                         color_hex=req.caption_color,
                         position=req.caption_position,
                         animation=req.caption_animation,
-                        output_dir=caps_dir
+                        out_mov=caps_mov
                     )
-
-                    input_idx = 1
-                    for png_path, c_a, c_b in overlays:
-                        cmd.extend(["-i", str(png_path)])
-                        next_v = f"[v_cap_{input_idx}]"
-                        filter_parts.append(f"{cur_v}[{input_idx}:v]overlay=0:0:enable='between(t,{c_a:.3f},{c_b:.3f})'{next_v}")
-                        cur_v = next_v
-                        input_idx += 1
+                    if ok_caps:
+                        cmd.extend(["-i", str(caps_mov)])
+                        if strip_w != target_w:
+                            filter_parts.append(f"[1:v]scale={target_w}:-2:flags=lanczos[cap_scaled]")
+                            filter_parts.append(f"{cur_v}[cap_scaled]overlay=0:{band_y}:shortest=1[v_final]")
+                        else:
+                            filter_parts.append(f"{cur_v}[1:v]overlay=0:{band_y}:shortest=1[v_final]")
+                        cur_v = "[v_final]"
 
                 final_filter = ";".join(filter_parts)
                 # Map the final video output at 60fps & high-bitrate audio
@@ -842,138 +1053,50 @@ def safe_float(val: Any, default: float = 60.0) -> float:
         return default
 
 
-@app.post("/stream/frame")
-def get_stream_frame(req: StreamFrameRequest):
-    """Extracts or retrieves a reference frame at any stream timestamp with multi-tier fail-safe fallbacks."""
-    clean_url = normalize_url(str(req.url or ""))
-    stream_id = extract_video_id(clean_url)
-    ts = max(1.0, safe_float(req.timestamp_seconds, 60.0))
-    frame_name = f"{stream_id}_{int(ts)}.jpg"
-    frame_path = FRAMES_DIR / frame_name
-
-    # If frame already exists with valid size (>30KB), return it immediately
+def _frame_is_hd(frame_path: Path) -> bool:
+    """Returns True only if frame exists, is >30KB, and width >= 1000px."""
     if not frame_path.exists() or frame_path.stat().st_size < 30000:
-        # Priority 1: Check if local video source is cached and duration covers this timestamp
-        cached_source = ROOT / "cache" / f"{stream_id}.mp4"
-        if cached_source.exists():
-            try:
-                dur_str = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(cached_source)])
-                if float(dur_str) >= ts:
-                    run(["ffmpeg", "-y", "-ss", str(ts), "-i", str(cached_source), "-vframes", "1", "-q:v", "2", str(frame_path)])
-            except Exception as fe:
-                print(f"Local ffmpeg extraction from cache failed: {fe}")
-
-    if not frame_path.exists() or frame_path.stat().st_size < 30000:
-        # Priority 2: Direct yt-dlp section fetch at exact timestamp with cookies & JS runtime
-        try:
-            temp_dir = ROOT / f"tmp_frame_{stream_id}_{int(ts)}"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            ytdlp_cmd = build_ytdlp_base_cmd() + [
-                "--download-sections", f"*{int(ts)}-{int(ts)+1}",
-                "-f", "bestvideo[height<=1080]/best[height<=1080]/best",
-                "-o", str(temp_dir / "sample.%(ext)s"),
-                clean_url
-            ]
-            run(ytdlp_cmd)
-            samples = [p for p in temp_dir.glob("sample.*") if p.is_file() and not p.name.endswith(".part")]
-            if samples:
-                run(["ffmpeg", "-y", "-i", str(samples[0]), "-vframes", "1", "-q:v", "2", str(frame_path)])
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception as fe:
-            print(f"Direct yt-dlp frame extract failed: {fe}")
-
-    if not frame_path.exists():
-        # Priority 4: Direct YouTube maxresdefault / hqdefault download via SSL unverified HTTP
-        for thumb_url in [
-            f"https://img.youtube.com/vi/{stream_id}/maxresdefault.jpg",
-            f"https://i.ytimg.com/vi/{stream_id}/hqdefault.jpg"
-        ]:
-            if download_url_file(thumb_url, frame_path):
-                break
-
-    if not frame_path.exists():
-        # Priority 5: Fallback synthetic frame so API never fails with 500
-        try:
-            img = Image.new("RGB", (1920, 1080), (12, 16, 24))
-            draw = ImageDraw.Draw(img)
-            draw.text((960, 540), f"{stream_id} @ {int(ts)}s", fill=(183, 243, 107), anchor="mm")
-            img.save(str(frame_path), format="JPEG")
-        except Exception:
-            pass
-
-    cam_box, game_box = detect_streamer_face(frame_path) if frame_path.exists() else (None, None)
-    if not cam_box:
-        cam_box = {"x": 0.05, "y": 0.18, "w": 0.26, "h": 0.34}
-    if not game_box:
-        game_box = {"x": 0.32, "y": 0.05, "w": 0.45, "h": 0.90}
-
-    return {
-        "frame_url": f"/frames/{frame_name}" if frame_path.exists() else "",
-        "timestamp_seconds": ts,
-        "detected_face": cam_box is not None,
-        "cam_box": cam_box,
-        "game_box": game_box
-    }
-
-
-@app.post("/stream/info")
-def get_stream_info(req: StreamInfoRequest):
-    """Fetches stream metadata and extracts a representative frame with AI face positioning."""
-    clean_url = normalize_url(str(req.url or ""))
-    stream_id = extract_video_id(clean_url)
-    ts = max(10.0, safe_float(req.timestamp_seconds, 60.0))
-
-    # 1. Inspect stream metadata via yt-dlp with oEmbed fallback
+        return False
     try:
-        ytdlp_cmd = build_ytdlp_base_cmd() + [
-            "--dump-json",
-            clean_url
-        ]
-        raw_json = run(ytdlp_cmd)
-        meta = json.loads(raw_json)
-        title = meta.get("title", "Livestream")
-        duration = float(meta.get("duration") or 0.0)
-        web_thumb = meta.get("thumbnail") or ""
-        src_w = int(meta.get("width") or 1920)
-        src_h = int(meta.get("height") or 1080)
-    except Exception as e:
-        logger.warning(f"yt-dlp metadata fetch failed, falling back to oEmbed: {e}")
-        # Fallback to oEmbed for title
-        oembed = fetch_youtube_oembed(clean_url)
-        title = oembed.get("title") or "Livestream"
-        duration = 0.0
-        web_thumb = oembed.get("thumbnail_url") or f"https://img.youtube.com/vi/{stream_id}/hqdefault.jpg"
-        src_w, src_h = 1920, 1080
+        img = cv2.imread(str(frame_path))
+        return img is not None and img.shape[1] >= 1000
+    except Exception:
+        return False
 
-    frame_name = f"{stream_id}_{int(ts)}.jpg"
-    frame_path = FRAMES_DIR / frame_name
 
-    if not frame_path.exists():
-        # Check local cache for this stream ID first
-        cached_source = ROOT / "cache" / f"{stream_id}.mp4"
-        if cached_source.exists():
-            try:
-                run(["ffmpeg", "-y", "-ss", str(ts), "-i", str(cached_source), "-vframes", "1", "-q:v", "2", str(frame_path)])
-            except Exception:
-                pass
+def _ensure_hd_frame(clean_url: str, stream_id: str, ts: float, frame_path: Path, web_thumb: str = "") -> None:
+    """Extracts an HD (>=1000px) reference frame cleanly without temp-dir collisions."""
+    if _frame_is_hd(frame_path):
+        return
 
-    if not frame_path.exists():
+    cached_source = ROOT / "cache" / f"{stream_id}.mp4"
+    if cached_source.exists():
         try:
-            temp_dir = ROOT / f"tmp_{stream_id}_{int(ts)}"
+            dur_str = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(cached_source)], timeout=10)
+            if float(dur_str) >= ts:
+                run(["ffmpeg", "-y", "-ss", str(ts), "-i", str(cached_source), "-vframes", "1", "-q:v", "2", str(frame_path)], timeout=20)
+        except Exception as fe:
+            logger.warning(f"Local ffmpeg extraction from cache failed: {fe}")
+
+    if not _frame_is_hd(frame_path):
+        temp_dir = ROOT / f"tmp_{stream_id}_{int(ts)}_{uuid.uuid4().hex[:6]}"
+        try:
             temp_dir.mkdir(parents=True, exist_ok=True)
             ytdlp_cmd = build_ytdlp_base_cmd() + [
+                "-S", "res,vcodec:h264",
                 "--download-sections", f"*{int(ts)}-{int(ts)+1}",
-                "-f", "bestvideo[height<=1080]/best[height<=1080]/best",
+                "-f", "bestvideo[height>=720]/bestvideo/best",
                 "-o", str(temp_dir / "sample.%(ext)s"),
                 clean_url
             ]
-            run(ytdlp_cmd)
+            run(ytdlp_cmd, timeout=45)
             samples = [p for p in temp_dir.glob("sample.*") if p.is_file() and not p.name.endswith(".part")]
             if samples:
-                run(["ffmpeg", "-y", "-i", str(samples[0]), "-vframes", "1", "-q:v", "2", str(frame_path)])
-            shutil.rmtree(temp_dir, ignore_errors=True)
+                run(["ffmpeg", "-y", "-i", str(samples[0]), "-vframes", "1", "-q:v", "2", str(frame_path)], timeout=20)
         except Exception as fe:
-            print(f"Direct frame download failed: {fe}")
+            logger.warning(f"Direct yt-dlp HD frame extract failed: {fe}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     if not frame_path.exists():
         for thumb_url in [
@@ -984,14 +1107,77 @@ def get_stream_info(req: StreamInfoRequest):
             if thumb_url and download_url_file(thumb_url, frame_path):
                 break
 
-    # Run AI face detection to auto-position camera and game bounding boxes
-    cam_box, game_box = detect_streamer_face(frame_path) if frame_path.exists() else (None, None)
 
-    # Fallbacks if face is not detected
+@app.post("/stream/frame")
+def get_stream_frame(req: StreamFrameRequest):
+    """Extracts or retrieves an HD reference frame at any stream timestamp."""
+    clean_url = normalize_url(str(req.url or ""))
+    stream_id = extract_video_id(clean_url)
+    ts = max(1.0, safe_float(req.timestamp_seconds, 60.0))
+    frame_name = f"{stream_id}_{int(ts)}.jpg"
+    frame_path = FRAMES_DIR / frame_name
+
+    _ensure_hd_frame(clean_url, stream_id, ts, frame_path)
+
+    if not frame_path.exists():
+        try:
+            img = Image.new("RGB", (1920, 1080), (36, 36, 35))
+            draw = ImageDraw.Draw(img)
+            draw.text((960, 540), f"{stream_id} @ {int(ts)}s", fill=(243, 107, 22), anchor="mm")
+            img.save(str(frame_path), format="JPEG")
+        except Exception:
+            pass
+
+    cam_box, game_box = detect_streamer_face(frame_path) if frame_path.exists() else (None, None)
+    detected = cam_box is not None
     if not cam_box:
-        cam_box = {"x": 0.05, "y": 0.18, "w": 0.26, "h": 0.34}
+        cam_box = {"x": 0.04, "y": 0.42, "w": 0.21, "h": 0.25}
     if not game_box:
-        game_box = {"x": 0.32, "y": 0.05, "w": 0.45, "h": 0.90}
+        game_box = {"x": 0.30, "y": 0.05, "w": 0.45, "h": 0.90}
+
+    return {
+        "frame_url": f"/frames/{frame_name}" if frame_path.exists() else "",
+        "timestamp_seconds": ts,
+        "detected_face": detected,
+        "cam_box": cam_box,
+        "game_box": game_box
+    }
+
+
+@app.post("/stream/info")
+def get_stream_info(req: StreamInfoRequest):
+    """Fetches stream metadata and extracts an HD reference frame with AI face positioning."""
+    clean_url = normalize_url(str(req.url or ""))
+    stream_id = extract_video_id(clean_url)
+    ts = max(10.0, safe_float(req.timestamp_seconds, 60.0))
+
+    try:
+        ytdlp_cmd = build_ytdlp_base_cmd() + ["--dump-json", clean_url]
+        raw_json = run(ytdlp_cmd, timeout=45)
+        meta = json.loads(raw_json)
+        title = meta.get("title", "Livestream")
+        duration = float(meta.get("duration") or 0.0)
+        web_thumb = meta.get("thumbnail") or ""
+        src_w = int(meta.get("width") or 1920)
+        src_h = int(meta.get("height") or 1080)
+    except Exception as e:
+        logger.warning(f"yt-dlp metadata fetch failed, falling back to oEmbed: {e}")
+        oembed = fetch_youtube_oembed(clean_url)
+        title = oembed.get("title") or "Livestream"
+        duration = 0.0
+        web_thumb = oembed.get("thumbnail_url") or f"https://img.youtube.com/vi/{stream_id}/hqdefault.jpg"
+        src_w, src_h = 1920, 1080
+
+    frame_name = f"{stream_id}_{int(ts)}.jpg"
+    frame_path = FRAMES_DIR / frame_name
+    _ensure_hd_frame(clean_url, stream_id, ts, frame_path, web_thumb=web_thumb)
+
+    cam_box, game_box = detect_streamer_face(frame_path) if frame_path.exists() else (None, None)
+    detected = cam_box is not None
+    if not cam_box:
+        cam_box = {"x": 0.04, "y": 0.42, "w": 0.21, "h": 0.25}
+    if not game_box:
+        game_box = {"x": 0.30, "y": 0.05, "w": 0.45, "h": 0.90}
 
     return {
         "id": stream_id,
@@ -1000,7 +1186,7 @@ def get_stream_info(req: StreamInfoRequest):
         "width": src_w,
         "height": src_h,
         "frame_url": f"/frames/{frame_name}" if frame_path.exists() else web_thumb,
-        "detected_face": cam_box is not None,
+        "detected_face": detected,
         "default_cam_box": cam_box,
         "default_game_box": game_box
     }
