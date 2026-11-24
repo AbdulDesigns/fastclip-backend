@@ -795,12 +795,20 @@ def fetch_youtube_oembed(video_url: str) -> dict:
         return {}
 
 
+def safe_float(val: Any, default: float = 60.0) -> float:
+    try:
+        f = float(val)
+        return default if math.isnan(f) or math.isinf(f) else f
+    except Exception:
+        return default
+
+
 @app.post("/stream/frame")
 def get_stream_frame(req: StreamFrameRequest):
     """Extracts or retrieves a reference frame at any stream timestamp with multi-tier fail-safe fallbacks."""
-    clean_url = normalize_url(str(req.url))
+    clean_url = normalize_url(str(req.url or ""))
     stream_id = extract_video_id(clean_url)
-    ts = max(1.0, req.timestamp_seconds)
+    ts = max(1.0, safe_float(req.timestamp_seconds, 60.0))
     frame_name = f"{stream_id}_{int(ts)}.jpg"
     frame_path = FRAMES_DIR / frame_name
 
@@ -872,9 +880,9 @@ def get_stream_frame(req: StreamFrameRequest):
 @app.post("/stream/info")
 def get_stream_info(req: StreamInfoRequest):
     """Fetches stream metadata and extracts a representative frame with AI face positioning."""
-    clean_url = normalize_url(str(req.url))
+    clean_url = normalize_url(str(req.url or ""))
     stream_id = extract_video_id(clean_url)
-    ts = max(10.0, req.timestamp_seconds)
+    ts = max(10.0, safe_float(req.timestamp_seconds, 60.0))
 
     # 1. Inspect stream metadata via yt-dlp with oEmbed fallback
     try:
