@@ -992,6 +992,29 @@ def get_stream_info(req: StreamInfoRequest):
     }
 
 
+@app.get("/test/ytdlp")
+def test_ytdlp(client: str = "android"):
+    ensure_cookies()
+    cmd = [
+        "yt-dlp",
+        "--no-check-certificates",
+        "--no-playlist",
+        "--extractor-args", f"youtube:player_client={client}",
+        "--dump-json",
+        "https://www.youtube.com/live/91c96JtcIFg"
+    ]
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 100:
+        cmd.extend(["--cookies", str(COOKIES_FILE)])
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return {
+        "returncode": p.returncode,
+        "stdout": p.stdout[:500],
+        "stderr": p.stderr[:1000],
+        "cookies_exists": COOKIES_FILE.exists(),
+        "cookies_size": COOKIES_FILE.stat().st_size if COOKIES_FILE.exists() else 0
+    }
+
+
 @app.api_route("/frames/{filename}", methods=["GET", "HEAD"])
 def get_frame(filename: str):
     path = (FRAMES_DIR / filename).resolve()
