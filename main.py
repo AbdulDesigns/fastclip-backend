@@ -270,15 +270,20 @@ def build_9_16_filter(
     def to_even(v: int) -> int:
         return max(2, (int(v) // 2) * 2)
 
-    cx = to_even(cam.x * source_w)
-    cy = to_even(cam.y * source_h)
-    cw = to_even(min(cam.w * source_w, source_w - cx))
-    ch = to_even(min(cam.h * source_h, source_h - cy))
+    def get_coord(box: Any, attr: str, default: float) -> float:
+        if isinstance(box, dict):
+            return float(box.get(attr, default))
+        return float(getattr(box, attr, default))
 
-    gx = to_even(game.x * source_w)
-    gy = to_even(game.y * source_h)
-    gw = to_even(min(game.w * source_w, source_w - gx))
-    gh = to_even(min(game.h * source_h, source_h - gy))
+    cx = to_even(get_coord(cam, "x", 0.05) * source_w)
+    cy = to_even(get_coord(cam, "y", 0.18) * source_h)
+    cw = to_even(min(get_coord(cam, "w", 0.26) * source_w, source_w - cx))
+    ch = to_even(min(get_coord(cam, "h", 0.34) * source_h, source_h - cy))
+
+    gx = to_even(get_coord(game, "x", 0.32) * source_w)
+    gy = to_even(get_coord(game, "y", 0.05) * source_h)
+    gw = to_even(min(get_coord(game, "w", 0.45) * source_w, source_w - gx))
+    gh = to_even(min(get_coord(game, "h", 0.90) * source_h, source_h - gy))
 
     if layout == "split":
         # Game on top, Cam on bottom
