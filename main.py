@@ -33,6 +33,8 @@ FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
 COOKIES_FILE = Path(__file__).resolve().parent / "youtube_cookies.txt"
 DENO_PATH = shutil.which("deno") or ("/opt/homebrew/bin/deno" if Path("/opt/homebrew/bin/deno").exists() else "deno")
+ARIA2_PATH = shutil.which("aria2c") or ("/opt/homebrew/bin/aria2c" if Path("/opt/homebrew/bin/aria2c").exists() else None)
+HAS_CURL_CFFI = importlib.util.find_spec("curl_cffi") is not None
 
 def ensure_cookies():
     """Restores YouTube cookies from YOUTUBE_COOKIES_BASE64 environment variable if available."""
@@ -49,7 +51,11 @@ def ensure_cookies():
 
 ensure_cookies()
 
-def build_ytdlp_base_cmd() -> list[str]:
+def build_ytdlp_base_cmd(
+    use_aria2: bool = False,
+    aria2_path: str | None = ARIA2_PATH,
+    enable_impersonate: bool = HAS_CURL_CFFI,
+) -> list[str]:
     ensure_cookies()
     cmd = [
         "yt-dlp",
@@ -62,6 +68,10 @@ def build_ytdlp_base_cmd() -> list[str]:
         "--js-runtimes", f"deno:{DENO_PATH}",
         "--concurrent-fragments", "4"
     ]
+    if enable_impersonate:
+        cmd.extend(["--impersonate", "chrome"])
+    if use_aria2 and aria2_path:
+        cmd.extend(["--downloader", aria2_path, "--downloader-args", "aria2c:-x 8 -s 8 -k 1M"])
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 100:
         cmd.extend(["--cookies", str(COOKIES_FILE)])
     else:
@@ -1566,7 +1576,8 @@ def worker(job_id: str, req: ClipRequest):
         work_source = work / "source.mp4"
 
         def _download_from_source() -> Path:
-            ytdlp_cmd = build_ytdlp_base_cmd()
+            is_section = (req.start_seconds is not None and req.end_seconds is not None)
+            ytdlp_cmd = build_ytdlp_base_cmd(use_aria2=not is_section)
             ytdlp_cmd.extend([
                 "-S", "res,fps,vcodec:h264",
                 "-f", "bestvideo[fps>=50]+bestaudio/bestvideo+bestaudio/best",
@@ -1574,7 +1585,7 @@ def worker(job_id: str, req: ClipRequest):
                 "-o", str(work / "source.%(ext)s")
             ])
 
-            if req.start_seconds is not None and req.end_seconds is not None:
+            if is_section:
                 ytdlp_cmd.extend(["--download-sections", f"*{req.start_seconds}-{req.end_seconds}"])
             else:
                 ytdlp_cmd.append("--live-from-start")
@@ -1584,7 +1595,7 @@ def worker(job_id: str, req: ClipRequest):
                 run(ytdlp_cmd, timeout=240)
             except Exception as dl_err:
                 try:
-                    fallback_cmd = build_ytdlp_base_cmd() + [
+                    fallback_cmd = build_ytdlp_base_cmd(use_aria2=False) + [
                         "-f", "bestvideo+bestaudio/best",
                         "--merge-output-format", "mp4",
                         "-o", str(work / "source.%(ext)s"),
