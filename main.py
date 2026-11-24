@@ -770,10 +770,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/health")
 @app.get("/healthz")
 def health():
+    ensure_cookies()
     return {
         "status": "ok",
         "service": "FastClip",
         "version": "0.3.0",
+        "cookies_file_exists": COOKIES_FILE.exists(),
+        "cookies_file_size": COOKIES_FILE.stat().st_size if COOKIES_FILE.exists() else 0,
+        "env_b64_len": len(os.getenv("YOUTUBE_COOKIES_BASE64") or ""),
+        "deno_path": DENO_PATH,
         "reel_layouts": ["split", "circle_cam", "game_only", "whole_screen", "big_cam", "cam_box", "cam_game"],
         "resolutions": ["1080p", "2k", "4k"],
         "fonts": ["Montserrat", "Anton", "Bangers", "BebasNeue"]
