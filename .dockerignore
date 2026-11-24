@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+.DS_Store
+*.part
+youtube_cookies.txt
+*.cookies
+.git
